@@ -221,8 +221,8 @@ async function sendDiscordNotification(job: WorkanaJob, webhookUrl: string): Pro
   }
 }
 
-// Check if a job was posted very recently (minutes ago or just now)
-// postedDate format examples: "8 minutes ago", "1 minute ago", "Just now", "5 minutes ago", etc.
+// Check if a job was posted "just now"
+// postedDate format examples: "Just now", "just now", etc.
 function isJobPostedVeryRecently(postedDate: string): boolean {
   if (!postedDate) {
     return false;
@@ -230,49 +230,127 @@ function isJobPostedVeryRecently(postedDate: string): boolean {
 
   const dateStr = postedDate.toLowerCase().trim();
   
-  // Check for "just now" or "now"
+  // Only check for "just now" or "now"
   if (dateStr.includes('just now') || dateStr === 'now') {
     return true;
   }
 
-  // Check for "X minute(s) ago" format
-  const minuteMatch = dateStr.match(/(\d+)\s*minute/i);
-  if (minuteMatch) {
-    // Jobs posted in minutes are considered very recent
+  // Anything else (minutes ago, hours, days, yesterday, etc.) is not considered
+  return false;
+}
+
+// Check if budget is hourly (contains "/hour")
+function isHourlyBudget(budget: string): boolean {
+  if (!budget) {
+    return false;
+  }
+  return budget.toLowerCase().includes('/hour');
+}
+
+// Check if budget is equal to or greater than 1000
+// Budget format examples: "USD 500 - 1,000", "Over USD 3,000", "Less than USD 50", "USD 15 - 45 / hour"
+function isBudgetAtLeast1000(budget: string): boolean {
+  if (!budget) {
+    return false;
+  }
+
+  const budgetStr = budget.toLowerCase();
+  
+  // Check for "over USD X" format
+  const overMatch = budgetStr.match(/over\s*(?:usd\s*)?([\d,]+)/i);
+  if (overMatch) {
+    const amount = parseInt(overMatch[1].replace(/,/g, ''), 10);
+    return amount >= 1000;
+  }
+
+  // Check for ranges like "USD 500 - 1,000" or "USD 1,000 - 3,000"
+  const rangeMatch = budgetStr.match(/(?:usd\s*)?([\d,]+)\s*-\s*([\d,]+)/i);
+  if (rangeMatch) {
+    const maxAmount = parseInt(rangeMatch[2].replace(/,/g, ''), 10);
+    return maxAmount >= 1000;
+  }
+
+  // Check for single amount like "USD 1,000" or "USD 2000"
+  const singleMatch = budgetStr.match(/(?:usd\s*)?([\d,]+)/i);
+  if (singleMatch) {
+    const amount = parseInt(singleMatch[1].replace(/,/g, ''), 10);
+    return amount >= 1000;
+  }
+
+  return false;
+}
+
+// Check if job meets the filtering criteria
+function meetsJobCriteria(job: WorkanaJob): boolean {
+  // Must be posted "just now"
+  if (!isJobPostedVeryRecently(job.postedDate)) {
+    return false;
+  }
+
+  // Parse rating value
+  const ratingValue = parseFloat(job.rating?.value || '0.00');
+  const hasRating = ratingValue > 0.0;
+  const hasVerifiedPayment = job.hasVerifiedPaymentMethod === true;
+  const isHourly = isHourlyBudget(job.budget);
+  const budgetAtLeast1000 = isBudgetAtLeast1000(job.budget);
+
+  // Condition 1: Verified Payment is true
+  if (hasVerifiedPayment) {
     return true;
   }
 
-  // Check for "X minutes ago" (plural)
-  const minutesAgoMatch = dateStr.match(/(\d+)\s*minutes/i);
-  if (minutesAgoMatch) {
+  // Condition 2: Rating is not 0.00 (has rating > 0.0)
+  if (hasRating) {
     return true;
   }
 
-  // Anything else (hours, days, yesterday, etc.) is not considered very recent
+  // Condition 3: Verified Payment is false AND Rating is 0.00 BUT Budget >= 1000
+  if (!hasVerifiedPayment && ratingValue === 0.00 && budgetAtLeast1000) {
+    return true;
+  }
+
+  // Condition 4: Projects priced at /hour (hourly)
+  if (isHourly) {
+    return true;
+  }
+
+  // Doesn't meet any criteria
   return false;
 }
 
 // Compare jobs and find new ones using slug as unique identifier
-// Only compares jobs posted "minutes ago" or "just now"
-// If a job with "minutes ago" or "just now" doesn't exist in saved list, it's considered new
+// Only compares jobs posted "just now" that meet the criteria:
+// - Verified Payment is true, OR
+// - Rating is not 0.00 (value > 0.0), OR
+// - Verified Payment is false AND Rating is 0.00 BUT Budget >= 1000, OR
+// - Budget is hourly (/hour)
+// If a job meeting these criteria doesn't exist in saved list, it's considered new
 function findNewJobs(currentJobs: WorkanaJob[], storedJobs: WorkanaJob[]): WorkanaJob[] {
   // Create a Set of stored job slugs for fast lookup
   const storedSlugs = new Set(storedJobs.map(job => job.slug?.trim()).filter(Boolean));
   
-  // First, filter to only jobs posted "minutes ago" or "just now"
-  const veryRecentJobs = currentJobs.filter(job => {
-    const isVeryRecent = isJobPostedVeryRecently(job.postedDate);
-    if (!isVeryRecent) {
-      console.log(`[findNewJobs] Skipping job ${job.slug} - not posted minutes ago (posted: ${job.postedDate})`);
+  // First, filter to only jobs posted "just now" that meet the criteria
+  const qualifiedJobs = currentJobs.filter(job => {
+    const meetsCriteria = meetsJobCriteria(job);
+    if (!meetsCriteria) {
+      const rating = parseFloat(job.rating?.value || '0.00');
+      console.log(`[findNewJobs] Skipping job ${job.slug} - doesn't meet criteria:`, {
+        posted: job.postedDate,
+        verifiedPayment: job.hasVerifiedPaymentMethod,
+        rating: rating,
+        budget: job.budget,
+        isHourly: isHourlyBudget(job.budget),
+        budgetAtLeast1000: isBudgetAtLeast1000(job.budget)
+      });
     }
-    return isVeryRecent;
+    return meetsCriteria;
   });
   
-  console.log('[findNewJobs] Very recent jobs (minutes ago/just now):', veryRecentJobs.length);
+  console.log('[findNewJobs] Qualified jobs (just now + meets criteria):', qualifiedJobs.length);
   
-  // Now compare these very recent jobs by slug against stored jobs
+  // Now compare these qualified jobs by slug against stored jobs
   // If a job doesn't exist in stored list, it's new
-  const newJobs = veryRecentJobs.filter(job => {
+  const newJobs = qualifiedJobs.filter(job => {
     const slug = job.slug?.trim();
     if (!slug) {
       console.warn('[findNewJobs] Job missing slug:', job);
@@ -289,31 +367,43 @@ function findNewJobs(currentJobs: WorkanaJob[], storedJobs: WorkanaJob[]): Worka
     return isNew;
   });
   
-  console.log('[findNewJobs] Comparing jobs by slug (only minutes ago/just now):');
+  console.log('[findNewJobs] Comparing jobs by slug (just now + criteria):');
   console.log('[findNewJobs] Current jobs count:', currentJobs.length);
-  console.log('[findNewJobs] Very recent jobs count (minutes ago/just now):', veryRecentJobs.length);
+  console.log('[findNewJobs] Qualified jobs count (just now + criteria):', qualifiedJobs.length);
   console.log('[findNewJobs] Stored jobs count:', storedJobs.length);
   console.log('[findNewJobs] Stored slugs count:', storedSlugs.size);
   
-  if (veryRecentJobs.length > 0) {
-    console.log('[findNewJobs] Very recent job slugs with posted dates:', 
-      veryRecentJobs.map(j => ({ slug: j.slug, posted: j.postedDate })));
+  if (qualifiedJobs.length > 0) {
+    console.log('[findNewJobs] Qualified job details:', 
+      qualifiedJobs.map(j => ({ 
+        slug: j.slug, 
+        posted: j.postedDate,
+        verifiedPayment: j.hasVerifiedPaymentMethod,
+        rating: j.rating?.value,
+        budget: j.budget
+      })));
   }
   
   if (storedSlugs.size > 0) {
     console.log('[findNewJobs] Sample stored slugs:', Array.from(storedSlugs).slice(0, 5));
   }
   
-  console.log('[findNewJobs] New jobs found (very recent AND not in stored):', newJobs.length);
+  console.log('[findNewJobs] New jobs found (qualified AND not in stored):', newJobs.length);
   if (newJobs.length > 0) {
-    console.log('[findNewJobs] New job slugs with posted dates:', 
-      newJobs.map(j => ({ slug: j.slug, posted: j.postedDate })));
+    console.log('[findNewJobs] New job details:', 
+      newJobs.map(j => ({ 
+        slug: j.slug, 
+        posted: j.postedDate,
+        verifiedPayment: j.hasVerifiedPaymentMethod,
+        rating: j.rating?.value,
+        budget: j.budget
+      })));
   } else {
     // Verify comparison is working
-    if (veryRecentJobs.length > 0) {
-      const veryRecentSlugs = new Set(veryRecentJobs.map(j => j.slug?.trim()).filter(Boolean));
-      const matchingCount = Array.from(veryRecentSlugs).filter(slug => storedSlugs.has(slug)).length;
-      console.log('[findNewJobs] Verification: very recent jobs already in stored:', matchingCount);
+    if (qualifiedJobs.length > 0) {
+      const qualifiedSlugs = new Set(qualifiedJobs.map(j => j.slug?.trim()).filter(Boolean));
+      const matchingCount = Array.from(qualifiedSlugs).filter(slug => storedSlugs.has(slug)).length;
+      console.log('[findNewJobs] Verification: qualified jobs already in stored:', matchingCount);
     }
   }
   
